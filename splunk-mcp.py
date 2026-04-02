@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """MCP server for Splunk. Borrows session credentials from Microsoft Edge on macOS."""
 
+import argparse
 import hashlib
 import http.client
 import json
@@ -22,11 +23,27 @@ from typing import Any, Dict, Optional, Tuple
 if sys.version_info < (3, 10):
     raise SystemExit("splunk-mcp.py requires Python 3.10 or newer")
 
+
 # ---------- Config ----------
 
-SPLUNK_HOST = os.environ.get("SPLUNK_HOST")
-if not SPLUNK_HOST:
-    raise SystemExit("SPLUNK_HOST env var required (e.g. myorg.splunkcloud.com)")
+
+def _load_runtime_config() -> Tuple[str, str]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--host")
+    parser.add_argument("--server-name")
+    args, _unknown = parser.parse_known_args()
+
+    splunk_host = args.host or os.environ.get("SPLUNK_HOST")
+    if not splunk_host:
+        raise SystemExit(
+            "SPLUNK_HOST env var required (e.g. myorg.splunkcloud.com), or pass --host"
+        )
+
+    server_name = args.server_name or os.environ.get("MCP_SERVER_NAME") or "splunk"
+    return splunk_host, server_name
+
+
+SPLUNK_HOST, SERVER_NAME = _load_runtime_config()
 
 EDGE_COOKIES_DB = (
     Path.home() / "Library/Application Support/Microsoft Edge/Default/Cookies"
@@ -288,22 +305,24 @@ def _request(
 ) -> Tuple[int, Any]:
     """Make HTTP request with automatic retry for transient errors."""
     last_error = None
-    
+
     for attempt in range(MAX_HTTP_RETRIES):
         try:
-            conn = http.client.HTTPSConnection(SPLUNK_HOST, context=_ssl_ctx, timeout=timeout)
+            conn = http.client.HTTPSConnection(
+                SPLUNK_HOST, context=_ssl_ctx, timeout=timeout
+            )
             try:
                 conn.request(method, path, body=body, headers=headers)
                 resp = conn.getresponse()
                 status = resp.status
                 raw = resp.read().decode("utf-8", errors="replace")
-                
+
                 # Retry on 502/503/504 (transient server errors)
                 if status in (502, 503, 504) and attempt < MAX_HTTP_RETRIES - 1:
-                    backoff = RETRY_BACKOFF_BASE ** attempt
+                    backoff = RETRY_BACKOFF_BASE**attempt
                     time.sleep(backoff)
                     continue
-                
+
                 try:
                     return status, json.loads(raw)
                 except (json.JSONDecodeError, ValueError):
@@ -313,12 +332,14 @@ def _request(
         except (http.client.HTTPException, OSError, TimeoutError) as e:
             last_error = e
             if attempt < MAX_HTTP_RETRIES - 1:
-                backoff = RETRY_BACKOFF_BASE ** attempt
+                backoff = RETRY_BACKOFF_BASE**attempt
                 time.sleep(backoff)
                 continue
             # Last attempt failed
-            raise RuntimeError(f"HTTP request failed after {MAX_HTTP_RETRIES} attempts: {e}") from e
-    
+            raise RuntimeError(
+                f"HTTP request failed after {MAX_HTTP_RETRIES} attempts: {e}"
+            ) from e
+
     # Should not reach here, but handle gracefully
     if last_error:
         raise RuntimeError(f"HTTP request failed: {last_error}") from last_error
@@ -442,7 +463,7 @@ def _search_async(
         status, body = _splunk_post("/services/search/jobs", create_params)
     except RuntimeError as e:
         return {"error": f"Failed to create search job: {e}"}
-    
+
     if status != 201:
         return {"error": f"Failed to create search job (HTTP {status}): {body}"}
 
@@ -454,7 +475,7 @@ def _search_async(
         poll_auth_retried = False
         consecutive_errors = 0
         max_consecutive_errors = 3
-        
+
         for poll_attempt in range(SEARCH_TIMEOUT_S // POLL_INTERVAL_S):
             if cancel_event and cancel_event.wait(POLL_INTERVAL_S):
                 raise _Cancelled()
@@ -469,7 +490,9 @@ def _search_async(
                 if consecutive_errors >= max_consecutive_errors:
                     return {"error": f"Network error polling job {sid}: {e}"}
                 # Wait longer before retry
-                if not cancel_event or not cancel_event.wait(RETRY_BACKOFF_BASE * consecutive_errors):
+                if not cancel_event or not cancel_event.wait(
+                    RETRY_BACKOFF_BASE * consecutive_errors
+                ):
                     continue
                 raise _Cancelled()
 
@@ -492,7 +515,7 @@ def _search_async(
                         "error": f"Server error polling job {sid} after {consecutive_errors} attempts (HTTP {poll_status}): {job_body}"
                     }
                 # Wait before retry with exponential backoff
-                backoff = min(RETRY_BACKOFF_BASE ** consecutive_errors, 30)
+                backoff = min(RETRY_BACKOFF_BASE**consecutive_errors, 30)
                 if not cancel_event or not cancel_event.wait(backoff):
                     continue
                 raise _Cancelled()
@@ -520,7 +543,9 @@ def _search_async(
                 msgs = entries[0].get("content", {}).get("messages", "")
                 return {"error": f"Search job failed: {msgs}"}
 
-        return {"error": f"Search timed out after {SEARCH_TIMEOUT_S}s (polled {poll_attempt + 1} times)"}
+        return {
+            "error": f"Search timed out after {SEARCH_TIMEOUT_S}s (polled {poll_attempt + 1} times)"
+        }
     except _Cancelled:
         return {"cancelled": True}
     except Exception as e:
@@ -626,18 +651,18 @@ def _do_search(
         if "cancelled" in result:
             return {"cancelled": True}
         if "error" in result:
-            error_msg = result['error']
+            error_msg = result["error"]
             # Provide helpful context for common errors
             if "502" in error_msg or "503" in error_msg or "504" in error_msg:
                 error_msg += "\n\nThis is a transient server error. The search may succeed if retried."
             elif "Network error" in error_msg:
-                error_msg += "\n\nCheck your network connection and Splunk server availability."
+                error_msg += (
+                    "\n\nCheck your network connection and Splunk server availability."
+                )
             elif "Auth failure" in error_msg:
                 error_msg += "\n\nYour Splunk session may have expired. Try refreshing your browser login."
             return {
-                "content": [
-                    {"type": "text", "text": f"Splunk error: {error_msg}"}
-                ],
+                "content": [{"type": "text", "text": f"Splunk error: {error_msg}"}],
                 "isError": True,
             }
         return {
@@ -646,9 +671,15 @@ def _do_search(
             ]
         }
     except ValueError as e:
-        return {"content": [{"type": "text", "text": f"Invalid argument: {e}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Invalid argument: {e}"}],
+            "isError": True,
+        }
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Unexpected error: {e}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Unexpected error: {e}"}],
+            "isError": True,
+        }
 
 
 def _do_indexes(
@@ -698,9 +729,15 @@ def _do_indexes(
             )
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
     except ValueError as e:
-        return {"content": [{"type": "text", "text": f"Invalid argument: {e}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Invalid argument: {e}"}],
+            "isError": True,
+        }
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Unexpected error: {e}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Unexpected error: {e}"}],
+            "isError": True,
+        }
 
 
 def _do_metadata(
@@ -743,9 +780,28 @@ def _do_metadata(
             sections.append("\n".join(lines))
         return {"content": [{"type": "text", "text": "\n\n".join(sections)}]}
     except ValueError as e:
-        return {"content": [{"type": "text", "text": f"Invalid argument: {e}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Invalid argument: {e}"}],
+            "isError": True,
+        }
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Unexpected error: {e}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Unexpected error: {e}"}],
+            "isError": True,
+        }
+
+
+def _do_server_info(
+    args: Dict[str, Any], cancel_event: Optional[threading.Event] = None
+) -> Dict[str, Any]:
+    _ = (args, cancel_event)
+    info = {
+        "server_name": SERVER_NAME,
+        "splunk_host": SPLUNK_HOST,
+        "pid": os.getpid(),
+        "argv": sys.argv,
+    }
+    return {"content": [{"type": "text", "text": json.dumps(info, indent=2)}]}
 
 
 # ---------- MCP protocol ----------
@@ -805,12 +861,21 @@ TOOLS = [
             "required": ["index"],
         },
     },
+    {
+        "name": "splunk-server-info",
+        "description": "Return active runtime configuration for this MCP server instance, including server name, Splunk host, PID, and argv.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 _TOOL_DISPATCH = {
     "splunk-search": _do_search,
     "splunk-indexes": _do_indexes,
     "splunk-search-metadata": _do_metadata,
+    "splunk-server-info": _do_server_info,
 }
 
 
@@ -907,7 +972,7 @@ def _handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "splunk", "version": "1.0.0"},
+                "serverInfo": {"name": SERVER_NAME, "version": "1.0.0"},
             },
         }
 

@@ -30,12 +30,14 @@ Tools:
 - `splunk-search`
 - `splunk-indexes`
 - `splunk-search-metadata`
+- `splunk-server-info`
 
 What they do:
 
 - `splunk-search`: runs an SPL query and returns formatted results
 - `splunk-indexes`: lists indexes with event counts and sizes
 - `splunk-search-metadata`: shows top hosts, sources, and sourcetypes for an index
+- `splunk-server-info`: returns the active MCP server runtime configuration, including the selected Splunk host
 
 ## Requirements
 
@@ -62,17 +64,28 @@ What they do:
 - active Splunk web session in Edge for the target Splunk host
 - `security` CLI available from macOS
 - `openssl` available in `PATH`
-- `SPLUNK_HOST` set to your Splunk host, for example:
+- a target Splunk host provided either by environment variable or CLI argument
+
+Environment variable example:
 
 ```bash
 export SPLUNK_HOST="myorg.splunkcloud.com"
 ```
 
+CLI argument example:
+
+```bash
+python3 /Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py \
+  --host myorg.splunkcloud.com \
+  --server-name splunk
+```
+
 Important notes:
 
 - `splunk-mcp.py` reads and decrypts Edge cookies from your local profile
-- it is intentionally tied to the logged-in Edge session for `SPLUNK_HOST`
+- it is intentionally tied to the logged-in Edge session for the selected Splunk host
 - if Edge is logged out, or the cookies do not exist for that host, the server will fail to authenticate
+- if you register multiple MCP servers that use the same script, prefer `--host` over env-only configuration so each instance is explicitly pinned to its own host
 
 ## Run directly
 
@@ -84,9 +97,19 @@ Examples:
 python3 /Users/ckoneru/GitRepos/myprojects/mybbscripts/elisp-eval-server.py
 ```
 
+Environment variable example:
+
 ```bash
 SPLUNK_HOST="myorg.splunkcloud.com" \
-python3 /Users/ckoneru/GitRepos/myprojects/mybbscripts/splunk-mcp.py
+python3 /Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py
+```
+
+Argument example:
+
+```bash
+python3 /Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py \
+  --host myorg.splunkcloud.com \
+  --server-name splunk
 ```
 
 ## Configure In Claude Code
@@ -95,7 +118,9 @@ Claude Code supports project-scoped `.mcp.json` files and CLI-based MCP registra
 
 ### Option 1: project `.mcp.json`
 
-Create `.mcp.json` in the repo root:
+Create `.mcp.json` in the repo root.
+
+Example using environment variables:
 
 ```json
 {
@@ -104,7 +129,7 @@ Create `.mcp.json` in the repo root:
       "type": "stdio",
       "command": "python3",
       "args": [
-        "/Users/ckoneru/GitRepos/myprojects/mybbscripts/elisp-eval-server.py"
+        "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/elisp-eval-server.py"
       ],
       "env": {}
     },
@@ -112,11 +137,40 @@ Create `.mcp.json` in the repo root:
       "type": "stdio",
       "command": "python3",
       "args": [
-        "/Users/ckoneru/GitRepos/myprojects/mybbscripts/splunk-mcp.py"
+        "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"
       ],
       "env": {
         "SPLUNK_HOST": "myorg.splunkcloud.com"
       }
+    }
+  }
+}
+```
+
+Example using explicit arguments (recommended when configuring multiple Splunk servers, such as prod and nonprod):
+
+```json
+{
+  "mcpServers": {
+    "mcpSplunk-prod": {
+      "type": "stdio",
+      "command": "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py",
+      "args": [
+        "--host",
+        "est-sh.prod.cloud-splunk-optum.com",
+        "--server-name",
+        "splunk-prod"
+      ]
+    },
+    "mcpSplunk-nonprod": {
+      "type": "stdio",
+      "command": "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py",
+      "args": [
+        "--host",
+        "est-sh.stage.aws-splunk-optum.com",
+        "--server-name",
+        "splunk-nonprod"
+      ]
     }
   }
 }
@@ -131,28 +185,42 @@ These are short and obvious, which helps agents choose the right server.
 
 ### Option 2: Claude CLI
 
-Add the servers with `claude mcp add-json`:
+Add the servers with `claude mcp add-json`.
+
+Environment variable example:
 
 ```bash
 claude mcp add-json emacs-elisp \
-  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/myprojects/mybbscripts/elisp-eval-server.py"],"env":{}}'
+  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/elisp-eval-server.py"],"env":{}}'
 ```
 
 ```bash
 claude mcp add-json splunk \
-  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/myprojects/mybbscripts/splunk-mcp.py"],"env":{"SPLUNK_HOST":"myorg.splunkcloud.com"}}'
+  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"],"env":{"SPLUNK_HOST":"myorg.splunkcloud.com"}}'
+```
+
+Explicit argument example:
+
+```bash
+claude mcp add-json mcpSplunk-prod \
+  '{"type":"stdio","command":"/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py","args":["--host","est-sh.prod.cloud-splunk-optum.com","--server-name","splunk-prod"]}'
+```
+
+```bash
+claude mcp add-json mcpSplunk-nonprod \
+  '{"type":"stdio","command":"/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py","args":["--host","est-sh.stage.aws-splunk-optum.com","--server-name","splunk-nonprod"]}'
 ```
 
 If you want the config checked into the repo for team use, use project scope:
 
 ```bash
 claude mcp add-json emacs-elisp --scope project \
-  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/myprojects/mybbscripts/elisp-eval-server.py"],"env":{}}'
+  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/elisp-eval-server.py"],"env":{}}'
 ```
 
 ```bash
 claude mcp add-json splunk --scope project \
-  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/myprojects/mybbscripts/splunk-mcp.py"],"env":{"SPLUNK_HOST":"myorg.splunkcloud.com"}}'
+  '{"type":"stdio","command":"python3","args":["/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"],"env":{"SPLUNK_HOST":"myorg.splunkcloud.com"}}'
 ```
 
 Verify:
@@ -172,15 +240,24 @@ Add `elisp-eval-server.py`:
 
 ```bash
 codex mcp add emacs-elisp -- \
-  python3 /Users/ckoneru/GitRepos/myprojects/mybbscripts/elisp-eval-server.py
+  python3 /Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/elisp-eval-server.py
 ```
 
-Add `splunk-mcp.py`:
+Add `splunk-mcp.py` with an environment variable:
 
 ```bash
 codex mcp add splunk \
   --env SPLUNK_HOST=myorg.splunkcloud.com \
-  -- python3 /Users/ckoneru/GitRepos/myprojects/mybbscripts/splunk-mcp.py
+  -- python3 /Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py
+```
+
+Add `splunk-mcp.py` with explicit arguments:
+
+```bash
+codex mcp add mcpSplunk-nonprod -- \
+  /Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py \
+  --host est-sh.stage.aws-splunk-optum.com \
+  --server-name splunk-nonprod
 ```
 
 Verify:
@@ -191,17 +268,29 @@ codex mcp list
 
 ### Option 2: `~/.codex/config.toml`
 
-Add entries like this:
+Environment variable example:
 
 ```toml
 [mcp_servers.emacs-elisp]
 command = "python3"
-args = ["/Users/ckoneru/GitRepos/myprojects/mybbscripts/elisp-eval-server.py"]
+args = ["/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/elisp-eval-server.py"]
 
 [mcp_servers.splunk]
 command = "python3"
-args = ["/Users/ckoneru/GitRepos/myprojects/mybbscripts/splunk-mcp.py"]
+args = ["/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"]
 env = { SPLUNK_HOST = "myorg.splunkcloud.com" }
+```
+
+Explicit argument example:
+
+```toml
+[mcp_servers.mcpSplunkProd]
+command = "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"
+args = ["--host", "est-sh.prod.cloud-splunk-optum.com", "--server-name", "splunk-prod"]
+
+[mcp_servers.mcpSplunkNonprod]
+command = "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"
+args = ["--host", "est-sh.stage.aws-splunk-optum.com", "--server-name", "splunk-nonprod"]
 ```
 
 Recommended names:
@@ -230,14 +319,17 @@ Example prompts:
   - `splunk-search`
   - `splunk-indexes`
   - `splunk-search-metadata`
+  - `splunk-server-info`
 - credentials are refreshed from Edge cookies when needed
 - long-running searches support cancellation via MCP notifications
+- use `splunk-server-info` to confirm which host a specific MCP server instance is actually using
 
 Example prompts:
 
 - `Use splunk-search to find error events for the last 4 hours`
 - `Use splunk-indexes to list indexes`
 - `Use splunk-search-metadata for index=main`
+- `Use splunk-server-info to show the active server host`
 
 ## Troubleshooting
 
@@ -253,7 +345,10 @@ If it fails:
 
 If it fails:
 
-- confirm `SPLUNK_HOST` exactly matches the Splunk cookie host in Edge
+- confirm the selected Splunk host exactly matches the Splunk cookie host in Edge
+- if you configured the server with `env`, verify `SPLUNK_HOST`
+- if you configured the server with args, verify `--host`
+- use `splunk-server-info` to confirm which host the running MCP server instance is actually using
 - confirm you are logged into Splunk in Edge
 - confirm the Edge profile path exists:
 
@@ -267,7 +362,7 @@ If it fails:
 security find-generic-password -s "Microsoft Edge Safe Storage" -a "Microsoft Edge" -w
 ```
 
-### Avoiding keychain popups (automation/CI)
+### Avoiding keychain popups (automation)
 
 The `splunk-mcp.py` script supports multiple credential storage methods to avoid interactive keychain prompts.
 

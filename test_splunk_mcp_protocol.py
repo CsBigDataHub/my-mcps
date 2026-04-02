@@ -10,6 +10,10 @@ import json
 import os
 import threading
 import unittest
+from collections.abc import Callable
+from types import ModuleType
+from typing import Any, Protocol, cast
+from unittest import mock
 
 # Ensure SPLUNK_HOST is set so the module can be imported
 os.environ.setdefault("SPLUNK_HOST", "example.com")
@@ -17,10 +21,38 @@ os.environ.setdefault("SPLUNK_HOST", "example.com")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MOD_PATH = os.path.join(_HERE, "splunk-mcp.py")
 
-spec = importlib.util.spec_from_file_location("splunk_mcp", _MOD_PATH)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
 
+class _SplunkModule(Protocol):
+    SPLUNK_HOST: str
+    SERVER_NAME: str
+    CANCELLED_ERROR_CODE: int
+    sys: ModuleType
+    _pending_lock: Any
+    _pending_requests: dict[Any, threading.Event]
+    _handle: Callable[[dict[str, Any]], Any]
+    _search_async: Callable[..., dict[str, Any]]
+    _do_search: Callable[..., dict[str, Any]]
+    _do_indexes: Callable[..., dict[str, Any]]
+    _do_metadata: Callable[..., dict[str, Any]]
+    _splunk_get: Callable[..., tuple[int, dict[str, Any]]]
+
+
+def _load_module(argv=None, env=None) -> _SplunkModule:
+    argv = argv or ["splunk-mcp.py"]
+    env = env or {"SPLUNK_HOST": "example.com"}
+    with mock.patch.dict(os.environ, env, clear=False), mock.patch("sys.argv", argv):
+        spec = importlib.util.spec_from_file_location("splunk_mcp", _MOD_PATH)
+        if spec is None:
+            raise AssertionError(f"Failed to create import spec for {_MOD_PATH}")
+        module = importlib.util.module_from_spec(spec)
+        exec_module = getattr(spec.loader, "exec_module", None)
+        if exec_module is None:
+            raise AssertionError("Import loader does not support exec_module")
+        exec_module(module)
+        return cast(_SplunkModule, module)
+
+
+mod = _load_module()
 _handle = mod._handle
 
 
@@ -49,6 +81,53 @@ class _Base(unittest.TestCase):
 
     def assert_dropped(self, resp):
         self.assertIsNone(resp)
+
+    def require_text(self, value: str | None) -> str:
+        if value is None:
+            raise AssertionError("Expected a text value")
+        return value
+
+
+# ── Runtime configuration ─────────────────────────────────────────────────
+
+
+class TestRuntimeConfig(_Base):
+    """Import-time runtime config selection."""
+
+    def test_defaults_server_name_to_splunk(self):
+        fresh_mod = _load_module(env={"SPLUNK_HOST": "example.com"})
+        self.assertEqual(fresh_mod.SPLUNK_HOST, "example.com")
+        self.assertEqual(fresh_mod.SERVER_NAME, "splunk")
+
+    def test_server_name_can_come_from_cli_args(self):
+        fresh_mod = _load_module(
+            argv=[
+                "splunk-mcp.py",
+                "--host",
+                "stage.example.com",
+                "--server-name",
+                "splunk-nonprod",
+            ],
+            env={"SPLUNK_HOST": "prod.example.com", "MCP_SERVER_NAME": "ignored"},
+        )
+        self.assertEqual(fresh_mod.SPLUNK_HOST, "stage.example.com")
+        self.assertEqual(fresh_mod.SERVER_NAME, "splunk-nonprod")
+
+    def test_server_name_can_come_from_env_when_arg_missing(self):
+        fresh_mod = _load_module(
+            argv=["splunk-mcp.py", "--host", "envtest.example.com"],
+            env={
+                "SPLUNK_HOST": "prod.example.com",
+                "MCP_SERVER_NAME": "splunk-from-env",
+            },
+        )
+        self.assertEqual(fresh_mod.SPLUNK_HOST, "envtest.example.com")
+        self.assertEqual(fresh_mod.SERVER_NAME, "splunk-from-env")
+
+    def test_import_requires_host_from_arg_or_env(self):
+        with self.assertRaises(SystemExit) as exc:
+            _load_module(argv=["splunk-mcp.py"], env={"SPLUNK_HOST": ""})
+        self.assertIn("SPLUNK_HOST env var required", str(exc.exception))
 
 
 # ── Base JSON-RPC validation ──────────────────────────────────────────────
@@ -297,7 +376,7 @@ class TestMethodDispatch(_Base):
         self.assert_success(resp)
         result = resp["result"]
         self.assertEqual(result["protocolVersion"], "2024-11-05")
-        self.assertEqual(result["serverInfo"]["name"], "splunk")
+        self.assertEqual(result["serverInfo"]["name"], mod.SERVER_NAME)
 
     def test_notifications_initialized(self):
         resp = _handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
@@ -312,6 +391,7 @@ class TestMethodDispatch(_Base):
         self.assertIn("splunk-search", names)
         self.assertIn("splunk-indexes", names)
         self.assertIn("splunk-search-metadata", names)
+        self.assertIn("splunk-server-info", names)
         by_name = {t["name"]: t for t in tools}
         self.assertEqual(
             by_name["splunk-search"]["inputSchema"]["properties"]["max_results"][
@@ -325,6 +405,23 @@ class TestMethodDispatch(_Base):
             ],
             "boolean",
         )
+        self.assertEqual(by_name["splunk-server-info"]["inputSchema"]["properties"], {})
+
+    def test_splunk_server_info_tool(self):
+        resp = _handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "splunk-server-info", "arguments": {}},
+            }
+        )
+        self.assert_success(resp)
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(payload["server_name"], mod.SERVER_NAME)
+        self.assertEqual(payload["splunk_host"], mod.SPLUNK_HOST)
+        self.assertIsInstance(payload["pid"], int)
+        self.assertEqual(payload["argv"], mod.sys.argv)
 
     def test_ping(self):
         resp = _handle({"jsonrpc": "2.0", "id": 1, "method": "ping"})
@@ -385,26 +482,22 @@ class TestMainLoop(_Base):
 
     def test_malformed_json(self):
         out = self._simulate_line("{bad json")
-        self.assertIsNotNone(out)
-        resp = json.loads(out)
+        resp = json.loads(self.require_text(out))
         self.assert_error_code(resp, -32700)
 
     def test_json_array(self):
         out = self._simulate_line("[1, 2, 3]")
-        self.assertIsNotNone(out)
-        resp = json.loads(out)
+        resp = json.loads(self.require_text(out))
         self.assert_error_code(resp, -32600)
 
     def test_json_string(self):
         out = self._simulate_line('"hello"')
-        self.assertIsNotNone(out)
-        resp = json.loads(out)
+        resp = json.loads(self.require_text(out))
         self.assert_error_code(resp, -32600)
 
     def test_json_number(self):
         out = self._simulate_line("42")
-        self.assertIsNotNone(out)
-        resp = json.loads(out)
+        resp = json.loads(self.require_text(out))
         self.assert_error_code(resp, -32600)
 
     def test_empty_line_ignored(self):
@@ -417,8 +510,7 @@ class TestMainLoop(_Base):
 
     def test_valid_request_through_main(self):
         out = self._simulate_line('{"jsonrpc":"2.0","id":1,"method":"ping"}')
-        self.assertIsNotNone(out)
-        resp = json.loads(out)
+        resp = json.loads(self.require_text(out))
         self.assert_success(resp)
 
 
