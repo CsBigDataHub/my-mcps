@@ -157,7 +157,7 @@ Example using explicit arguments (recommended when configuring multiple Splunk s
       "command": "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py",
       "args": [
         "--host",
-        "est-sh.prod.cloud-splunk-optum.com",
+        "est-sh.prod.cloud-splunk-company.com",
         "--server-name",
         "splunk-prod"
       ]
@@ -167,7 +167,7 @@ Example using explicit arguments (recommended when configuring multiple Splunk s
       "command": "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py",
       "args": [
         "--host",
-        "est-sh.stage.aws-splunk-optum.com",
+        "est-sh.stage.aws-splunk-company.com",
         "--server-name",
         "splunk-nonprod"
       ]
@@ -203,12 +203,12 @@ Explicit argument example:
 
 ```bash
 claude mcp add-json mcpSplunk-prod \
-  '{"type":"stdio","command":"/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py","args":["--host","est-sh.prod.cloud-splunk-optum.com","--server-name","splunk-prod"]}'
+  '{"type":"stdio","command":"/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py","args":["--host","est-sh.prod.cloud-splunk-company.com","--server-name","splunk-prod"]}'
 ```
 
 ```bash
 claude mcp add-json mcpSplunk-nonprod \
-  '{"type":"stdio","command":"/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py","args":["--host","est-sh.stage.aws-splunk-optum.com","--server-name","splunk-nonprod"]}'
+  '{"type":"stdio","command":"/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py","args":["--host","est-sh.stage.aws-splunk-company.com","--server-name","splunk-nonprod"]}'
 ```
 
 If you want the config checked into the repo for team use, use project scope:
@@ -256,7 +256,7 @@ Add `splunk-mcp.py` with explicit arguments:
 ```bash
 codex mcp add mcpSplunk-nonprod -- \
   /Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py \
-  --host est-sh.stage.aws-splunk-optum.com \
+  --host est-sh.stage.aws-splunk-company.com \
   --server-name splunk-nonprod
 ```
 
@@ -286,11 +286,11 @@ Explicit argument example:
 ```toml
 [mcp_servers.mcpSplunkProd]
 command = "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"
-args = ["--host", "est-sh.prod.cloud-splunk-optum.com", "--server-name", "splunk-prod"]
+args = ["--host", "est-sh.prod.cloud-splunk-company.com", "--server-name", "splunk-prod"]
 
 [mcp_servers.mcpSplunkNonprod]
 command = "/Users/ckoneru/GitRepos/team-loki/ocdp-team-loki-mcp-scripts/splunk-mcp.py"
-args = ["--host", "est-sh.stage.aws-splunk-optum.com", "--server-name", "splunk-nonprod"]
+args = ["--host", "est-sh.stage.aws-splunk-company.com", "--server-name", "splunk-nonprod"]
 ```
 
 Recommended names:
