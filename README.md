@@ -267,6 +267,67 @@ If it fails:
 security find-generic-password -s "Microsoft Edge Safe Storage" -a "Microsoft Edge" -w
 ```
 
+### Avoiding keychain popups (automation/CI)
+
+The `splunk-mcp.py` script supports multiple credential storage methods to avoid interactive keychain prompts.
+
+**Quick setup with helper script (recommended)**
+
+Run the interactive setup script to extract and store your password once:
+
+```bash
+./setup-edge-password.sh
+```
+
+The script will prompt you once for keychain access, then let you choose:
+1. Environment variable (add to `~/.bashrc` or `~/.zshrc`)
+2. Plain text file with chmod 600 (recommended for most users)
+3. GPG encrypted file (most secure)
+
+**Manual setup options**
+
+**Method 1: Environment variable (recommended for automation)**
+
+```bash
+# Extract password once (will prompt)
+PASSWORD=$(security find-generic-password -s "Microsoft Edge Safe Storage" -a "Microsoft Edge" -w)
+
+# Add to your shell profile (~/.bashrc or ~/.zshrc)
+export EDGE_SAFE_STORAGE_PASSWORD='your-password-here'
+```
+
+**Method 2: Plain text file (secure with file permissions)**
+
+```bash
+# Extract and save password
+mkdir -p ~/.splunk-mcp
+security find-generic-password -s "Microsoft Edge Safe Storage" -a "Microsoft Edge" -w > ~/.splunk-mcp/edge-password
+chmod 600 ~/.splunk-mcp/edge-password
+```
+
+**Method 3: GPG encrypted file (most secure)**
+
+```bash
+# Extract and encrypt password
+mkdir -p ~/.splunk-mcp
+security find-generic-password -s "Microsoft Edge Safe Storage" -a "Microsoft Edge" -w | \
+  gpg --encrypt --recipient your-email@example.com > ~/.splunk-mcp/edge-password.gpg
+```
+
+**Method 4: Allow keychain prompts (not recommended for automation)**
+
+```bash
+export ALLOW_KEYCHAIN_PROMPT=1
+```
+
+**Credential lookup order**
+
+The script tries methods in this order:
+1. `EDGE_SAFE_STORAGE_PASSWORD` environment variable
+2. `~/.splunk-mcp/edge-password` file (must be chmod 600)
+3. `~/.splunk-mcp/edge-password.gpg` file (decrypts with gpg)
+4. macOS Keychain (only if `ALLOW_KEYCHAIN_PROMPT=1` is set)
+
 ## Developer notes
 
 ### Test commands

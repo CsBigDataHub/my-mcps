@@ -36,6 +36,8 @@ POLL_INTERVAL_S = 2
 SEARCH_TIMEOUT_S = 120
 HTTP_TIMEOUT_S = 45
 MAX_WORKERS = 4
+MAX_HTTP_RETRIES = 3
+RETRY_BACKOFF_BASE = 2  # seconds
 
 # ---------- State ----------
 
@@ -57,23 +59,85 @@ _ssl_ctx = ssl.create_default_context()
 
 
 def _keychain_password() -> str:
-    r = subprocess.run(
-        [
-            "security",
-            "find-generic-password",
-            "-s",
-            "Microsoft Edge Safe Storage",
-            "-a",
-            "Microsoft Edge",
-            "-w",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
+    """
+    Retrieve Edge Safe Storage password with multiple methods (avoiding keychain popup):
+    1. Environment variable: EDGE_SAFE_STORAGE_PASSWORD
+    2. Plain text file: ~/.splunk-mcp/edge-password (chmod 600)
+    3. GPG encrypted file: ~/.splunk-mcp/edge-password.gpg
+    4. macOS Keychain (SKIPPED by default to avoid popup - set ALLOW_KEYCHAIN_PROMPT=1 to enable)
+    """
+    # Method 1: Environment variable (best for automation/CI)
+    env_password = os.environ.get("EDGE_SAFE_STORAGE_PASSWORD")
+    if env_password:
+        return env_password
+
+    # Method 2: Plain text file (must be chmod 600 for security)
+    password_file = Path.home() / ".splunk-mcp" / "edge-password"
+    if password_file.exists():
+        stat_info = password_file.stat()
+        if stat_info.st_mode & 0o077:  # Check if group/other have any permissions
+            raise RuntimeError(
+                f"Insecure permissions on {password_file}. Run: chmod 600 {password_file}"
+            )
+        return password_file.read_text().strip()
+
+    # Method 3: GPG encrypted file
+    gpg_file = Path.home() / ".splunk-mcp" / "edge-password.gpg"
+    if gpg_file.exists():
+        try:
+            result = subprocess.run(
+                ["gpg", "--decrypt", "--quiet", str(gpg_file)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # gpg not available or timed out
+
+    # Method 4: macOS Keychain (ONLY if explicitly allowed to avoid popup)
+    if os.environ.get("ALLOW_KEYCHAIN_PROMPT") == "1":
+        try:
+            r = subprocess.run(
+                [
+                    "security",
+                    "find-generic-password",
+                    "-s",
+                    "Microsoft Edge Safe Storage",
+                    "-a",
+                    "Microsoft Edge",
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except subprocess.TimeoutExpired:
+            pass
+
+    # All methods failed
+    raise RuntimeError(
+        "Could not retrieve Microsoft Edge keychain password. No popup-free methods found.\n\n"
+        "Setup instructions (choose one):\n\n"
+        "1. Environment variable (recommended for automation):\n"
+        "   export EDGE_SAFE_STORAGE_PASSWORD='your-password-here'\n\n"
+        "2. Plain text file (secure with file permissions):\n"
+        "   mkdir -p ~/.splunk-mcp\n"
+        "   echo 'your-password-here' > ~/.splunk-mcp/edge-password\n"
+        "   chmod 600 ~/.splunk-mcp/edge-password\n\n"
+        "3. GPG encrypted file (most secure):\n"
+        "   mkdir -p ~/.splunk-mcp\n"
+        "   echo 'your-password-here' | gpg --encrypt --recipient your-email@example.com > ~/.splunk-mcp/edge-password.gpg\n\n"
+        "4. Allow keychain popup (not recommended for automation):\n"
+        "   export ALLOW_KEYCHAIN_PROMPT=1\n\n"
+        "To get your password from keychain once:\n"
+        "   security find-generic-password -s 'Microsoft Edge Safe Storage' -a 'Microsoft Edge' -w\n"
     )
-    if r.returncode != 0:
-        raise RuntimeError("Could not retrieve Microsoft Edge keychain password")
-    return r.stdout.strip()
 
 
 def _derive_key(password: str) -> bytes:
@@ -220,19 +284,45 @@ def _request(
     headers: Dict[str, str],
     body: Optional[bytes] = None,
     timeout: int = HTTP_TIMEOUT_S,
+    retry_count: int = 0,
 ) -> Tuple[int, Any]:
-    conn = http.client.HTTPSConnection(SPLUNK_HOST, context=_ssl_ctx, timeout=timeout)
-    try:
-        conn.request(method, path, body=body, headers=headers)
-        resp = conn.getresponse()
-        status = resp.status
-        raw = resp.read().decode("utf-8", errors="replace")
+    """Make HTTP request with automatic retry for transient errors."""
+    last_error = None
+    
+    for attempt in range(MAX_HTTP_RETRIES):
         try:
-            return status, json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return status, raw
-    finally:
-        conn.close()
+            conn = http.client.HTTPSConnection(SPLUNK_HOST, context=_ssl_ctx, timeout=timeout)
+            try:
+                conn.request(method, path, body=body, headers=headers)
+                resp = conn.getresponse()
+                status = resp.status
+                raw = resp.read().decode("utf-8", errors="replace")
+                
+                # Retry on 502/503/504 (transient server errors)
+                if status in (502, 503, 504) and attempt < MAX_HTTP_RETRIES - 1:
+                    backoff = RETRY_BACKOFF_BASE ** attempt
+                    time.sleep(backoff)
+                    continue
+                
+                try:
+                    return status, json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    return status, raw
+            finally:
+                conn.close()
+        except (http.client.HTTPException, OSError, TimeoutError) as e:
+            last_error = e
+            if attempt < MAX_HTTP_RETRIES - 1:
+                backoff = RETRY_BACKOFF_BASE ** attempt
+                time.sleep(backoff)
+                continue
+            # Last attempt failed
+            raise RuntimeError(f"HTTP request failed after {MAX_HTTP_RETRIES} attempts: {e}") from e
+    
+    # Should not reach here, but handle gracefully
+    if last_error:
+        raise RuntimeError(f"HTTP request failed: {last_error}") from last_error
+    return 500, "Unknown error"
 
 
 def _session_expired(status: int, body) -> bool:
@@ -348,7 +438,11 @@ def _search_async(
     if params:
         create_params.update({k: v for k, v in params.items() if k != "count"})
 
-    status, body = _splunk_post("/services/search/jobs", create_params)
+    try:
+        status, body = _splunk_post("/services/search/jobs", create_params)
+    except RuntimeError as e:
+        return {"error": f"Failed to create search job: {e}"}
+    
     if status != 201:
         return {"error": f"Failed to create search job (HTTP {status}): {body}"}
 
@@ -358,16 +452,29 @@ def _search_async(
 
     try:
         poll_auth_retried = False
-        for _ in range(SEARCH_TIMEOUT_S // POLL_INTERVAL_S):
+        consecutive_errors = 0
+        max_consecutive_errors = 3
+        
+        for poll_attempt in range(SEARCH_TIMEOUT_S // POLL_INTERVAL_S):
             if cancel_event and cancel_event.wait(POLL_INTERVAL_S):
                 raise _Cancelled()
             if not cancel_event:
                 time.sleep(POLL_INTERVAL_S)
 
-            poll_status, job_body = _splunk_get(f"/services/search/jobs/{sid}")
+            try:
+                poll_status, job_body = _splunk_get(f"/services/search/jobs/{sid}")
+                consecutive_errors = 0  # Reset on successful request
+            except RuntimeError as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    return {"error": f"Network error polling job {sid}: {e}"}
+                # Wait longer before retry
+                if not cancel_event or not cancel_event.wait(RETRY_BACKOFF_BASE * consecutive_errors):
+                    continue
+                raise _Cancelled()
 
             # Handle HTTP-level errors during polling
-            # Note: _splunk_get() already retries once with fresh creds internally,
+            # Note: _splunk_get() already retries internally,
             # so if we still see session-expired here, the retry already failed.
             if _session_expired(poll_status, job_body):
                 if not poll_auth_retried:
@@ -379,9 +486,16 @@ def _search_async(
                     "error": f"Search job {sid} not found (HTTP 404) — may have been reaped"
                 }
             if poll_status >= 500:
-                return {
-                    "error": f"Server error polling job {sid} (HTTP {poll_status}): {job_body}"
-                }
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    return {
+                        "error": f"Server error polling job {sid} after {consecutive_errors} attempts (HTTP {poll_status}): {job_body}"
+                    }
+                # Wait before retry with exponential backoff
+                backoff = min(RETRY_BACKOFF_BASE ** consecutive_errors, 30)
+                if not cancel_event or not cancel_event.wait(backoff):
+                    continue
+                raise _Cancelled()
 
             entries = []
             state = ""
@@ -391,21 +505,26 @@ def _search_async(
                     state = entries[0].get("content", {}).get("dispatchState", "")
 
             if state == "DONE":
-                rs, rb = _splunk_get(
-                    f"/services/search/jobs/{sid}/results",
-                    {"count": str(max_results), "output_mode": "json"},
-                )
+                try:
+                    rs, rb = _splunk_get(
+                        f"/services/search/jobs/{sid}/results",
+                        {"count": str(max_results), "output_mode": "json"},
+                    )
+                except RuntimeError as e:
+                    return {"error": f"Failed to fetch results: {e}"}
                 if rs == 200 and isinstance(rb, dict):
                     return {"results": rb.get("results", [])}
-                return {"error": f"Failed to fetch results (HTTP {rs})"}
+                return {"error": f"Failed to fetch results (HTTP {rs}): {rb}"}
 
             if state == "FAILED":
                 msgs = entries[0].get("content", {}).get("messages", "")
                 return {"error": f"Search job failed: {msgs}"}
 
-        return {"error": "Search timed out after 120s"}
+        return {"error": f"Search timed out after {SEARCH_TIMEOUT_S}s (polled {poll_attempt + 1} times)"}
     except _Cancelled:
         return {"cancelled": True}
+    except Exception as e:
+        return {"error": f"Unexpected error during search: {e}"}
     finally:
         _splunk_delete(f"/services/search/jobs/{sid}")
 
@@ -507,9 +626,17 @@ def _do_search(
         if "cancelled" in result:
             return {"cancelled": True}
         if "error" in result:
+            error_msg = result['error']
+            # Provide helpful context for common errors
+            if "502" in error_msg or "503" in error_msg or "504" in error_msg:
+                error_msg += "\n\nThis is a transient server error. The search may succeed if retried."
+            elif "Network error" in error_msg:
+                error_msg += "\n\nCheck your network connection and Splunk server availability."
+            elif "Auth failure" in error_msg:
+                error_msg += "\n\nYour Splunk session may have expired. Try refreshing your browser login."
             return {
                 "content": [
-                    {"type": "text", "text": f"Splunk error: {result['error']}"}
+                    {"type": "text", "text": f"Splunk error: {error_msg}"}
                 ],
                 "isError": True,
             }
@@ -518,8 +645,10 @@ def _do_search(
                 {"type": "text", "text": _format_results(result["results"], max_n)}
             ]
         }
+    except ValueError as e:
+        return {"content": [{"type": "text", "text": f"Invalid argument: {e}"}], "isError": True}
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
+        return {"content": [{"type": "text", "text": f"Unexpected error: {e}"}], "isError": True}
 
 
 def _do_indexes(
@@ -528,7 +657,15 @@ def _do_indexes(
     try:
         if cancel_event and cancel_event.is_set():
             return {"cancelled": True}
-        status, body = _splunk_get("/services/data/indexes", {"count": "0"})
+        try:
+            status, body = _splunk_get("/services/data/indexes", {"count": "0"})
+        except RuntimeError as e:
+            return {
+                "content": [
+                    {"type": "text", "text": f"Network error fetching indexes: {e}"}
+                ],
+                "isError": True,
+            }
         if cancel_event and cancel_event.is_set():
             return {"cancelled": True}
         if status != 200:
@@ -560,8 +697,10 @@ def _do_indexes(
                 f"  {ix['name']} - events: {ix['events']}, size: {ix['size']} MB"
             )
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+    except ValueError as e:
+        return {"content": [{"type": "text", "text": f"Invalid argument: {e}"}], "isError": True}
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
+        return {"content": [{"type": "text", "text": f"Unexpected error: {e}"}], "isError": True}
 
 
 def _do_metadata(
@@ -603,8 +742,10 @@ def _do_metadata(
                 )
             sections.append("\n".join(lines))
         return {"content": [{"type": "text", "text": "\n\n".join(sections)}]}
+    except ValueError as e:
+        return {"content": [{"type": "text", "text": f"Invalid argument: {e}"}], "isError": True}
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
+        return {"content": [{"type": "text", "text": f"Unexpected error: {e}"}], "isError": True}
 
 
 # ---------- MCP protocol ----------
