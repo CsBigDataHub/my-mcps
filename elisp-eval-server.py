@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """MCP server for elisp evaluation via emacsclient.
-Writes code to a temp file and evals it - no shell escaping issues.
 
-Original Author: Ag Ibragimov - github.com/agzam
-Based on Ovi Stoica's suggestion on Clojurians.
+Uses an inline base64 fast path for most requests and falls back to a temp file
+for oversized payloads, avoiding shell-escaping issues in both modes.
 """
 
+import base64
 import json
 import os
 import subprocess
@@ -39,6 +39,7 @@ TOOL = {
 # ---------- Elisp evaluation ----------
 
 EMACSCLIENT = "/Applications/Emacs.app/Contents/MacOS/bin/emacsclient"
+INLINE_CODE_MAX_BYTES = 256 * 1024
 
 
 def _run_emacsclient(wrapper: str, timeout_s: float = 60) -> dict:
@@ -73,78 +74,120 @@ def _run_emacsclient(wrapper: str, timeout_s: float = 60) -> dict:
     }
 
 
-def _eval_elisp(code: str) -> dict:
-    """Write code to a temp file, wrap it in a progn-reader, eval via emacsclient."""
-    fd_code, path_code = tempfile.mkstemp(prefix="eca-elisp-", suffix=".el")
-    fd_msgs, path_msgs = tempfile.mkstemp(prefix="eca-msgs-", suffix=".txt")
-    try:
-        # Close the msgs fd immediately — Emacs will write to it by path
-        os.close(fd_msgs)
+def _elisp_string(value: str) -> str:
+    """Return a JSON-escaped string literal compatible with Elisp string syntax."""
+    return json.dumps(value)
 
-        # Write the user's elisp code to the temp file
+
+def _build_eval_wrapper(payload: str, *, use_temp_file: bool) -> str:
+    """Build Elisp wrapper for either inline base64 payloads or temp-file input."""
+    if use_temp_file:
+        source_expr = f"(insert-file-contents {_elisp_string(payload)})"
+    else:
+        source_expr = f"(insert (base64-decode-string {_elisp_string(payload)}))"
+
+    return (
+        "(progn\n"
+        "  (require 'json)\n"
+        '  (let* ((msgs-buf (get-buffer-create "*Messages*"))\n'
+        "         (msgs-pos (with-current-buffer msgs-buf (point-max)))\n"
+        "         (result (with-temp-buffer\n"
+        f"                   {source_expr}\n"
+        "                   (goto-char (point-min))\n"
+        "                   (let (forms)\n"
+        "                     (condition-case nil\n"
+        "                         (while t (push (read (current-buffer)) forms))\n"
+        "                       (end-of-file nil))\n"
+        "                     (eval (cons 'progn (nreverse forms)) t))))\n"
+        "         (new-msgs (with-current-buffer msgs-buf\n"
+        "                     (let ((s (string-trim (buffer-substring-no-properties msgs-pos (point-max)))))\n"
+        "                       (and (not (string-empty-p s)) s)))))\n"
+        '    (json-encode (list (cons "result" (format "%S" result))\n'
+        '                       (cons "messages" new-msgs)))))'
+    )
+
+
+def _parse_emacs_eval_output(stdout: str) -> dict:
+    """Parse JSON emitted by the Emacs wrapper.
+
+    emacsclient prints the return value of the evaluated expression. Since json-encode
+    returns a string, emacsclient will print it as a quoted Lisp string. We need to
+    parse it twice: once to get the string value, then again to get the JSON object.
+    """
+    stdout = stdout.strip()
+    if not stdout:
+        raise ValueError("Emacs response was empty")
+    
+    # First parse: get the string from the Lisp representation
+    payload = json.loads(stdout)
+    
+    # If it's a string, parse it again to get the actual JSON object
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    
+    if not isinstance(payload, dict):
+        raise ValueError("Emacs response was not a JSON object")
+    return payload
+
+
+def _format_eval_result(payload: dict) -> dict:
+    """Translate wrapper payload into the existing MCP tool result shape."""
+    result = payload.get("result")
+    messages = payload.get("messages")
+    if not isinstance(result, str):
+        raise ValueError("Emacs response missing string result")
+
+    content = [{"type": "text", "text": result}]
+    if isinstance(messages, str) and messages:
+        content.append({"type": "text", "text": f"--- *Messages* ---\n{messages}"})
+    return {"content": content}
+
+
+def _process_emacsclient_result(proc_result: dict) -> dict:
+    """Convert a raw emacsclient result into an MCP tool result payload."""
+    if proc_result.get("isError"):
+        return proc_result
+
+    proc_stdout = proc_result["stdout"]
+    proc_stderr = proc_result["stderr"]
+    proc_returncode = proc_result["returncode"]
+
+    if proc_returncode == 0:
+        try:
+            return _format_eval_result(_parse_emacs_eval_output(proc_stdout))
+        except (json.JSONDecodeError, ValueError) as exc:
+            combined = (proc_stdout + proc_stderr).strip()
+            if combined:
+                combined = f"{combined}\n\nFailed to parse structured Emacs response: {exc}"
+            else:
+                combined = f"Failed to parse structured Emacs response: {exc}"
+            return {
+                "content": [{"type": "text", "text": combined}],
+                "isError": True,
+            }
+
+    combined = (proc_stdout + proc_stderr).strip()
+    return {"content": [{"type": "text", "text": combined}], "isError": True}
+
+
+def _eval_elisp(code: str) -> dict:
+    """Evaluate Elisp via emacsclient, using inline payloads for the fast path."""
+    code_bytes = code.encode("utf-8")
+    if len(code_bytes) <= INLINE_CODE_MAX_BYTES:
+        payload = base64.b64encode(code_bytes).decode("ascii")
+        wrapper = _build_eval_wrapper(payload, use_temp_file=False)
+        return _process_emacsclient_result(_run_emacsclient(wrapper, timeout_s=60))
+
+    fd_code, path_code = tempfile.mkstemp(prefix="eca-elisp-", suffix=".el")
+    try:
         with os.fdopen(fd_code, "w") as f:
             f.write(code)
 
-        # Build the wrapper elisp that:
-        # 1. Records current *Messages* position
-        # 2. Reads+evals all forms from the temp file
-        # 3. Captures any new *Messages* output to a second temp file
-        # 4. Returns the eval result
-        wrapper = (
-            '(let* ((msgs-buf (get-buffer-create "*Messages*"))\n'
-            "       (msgs-pos (with-current-buffer msgs-buf (point-max)))\n"
-            "       (result (with-temp-buffer\n"
-            '                 (insert-file-contents "' + path_code + '")\n'
-            "                 (goto-char (point-min))\n"
-            "                 (let (forms)\n"
-            "                   (condition-case nil\n"
-            "                       (while t (push (read (current-buffer)) forms))\n"
-            "                     (end-of-file nil))\n"
-            "                   (eval (cons 'progn (nreverse forms)) t))))\n"
-            "       (new-msgs (with-current-buffer msgs-buf\n"
-            "                   (let ((s (string-trim (buffer-substring-no-properties msgs-pos (point-max)))))\n"
-            "                     (and (not (string-empty-p s)) s)))))\n"
-            "  (when new-msgs\n"
-            '    (write-region new-msgs nil "' + path_msgs + "\" nil 'silent))\n"
-            "  result)"
-        )
-
-        proc_result = _run_emacsclient(wrapper, timeout_s=60)
-        if proc_result.get("isError"):
-            return proc_result
-
-        proc_stdout = proc_result["stdout"]
-        proc_stderr = proc_result["stderr"]
-        proc_returncode = proc_result["returncode"]
-
-        # Read any captured *Messages* output
-        messages = None
-        try:
-            with open(path_msgs, "r") as f:
-                s = f.read().strip()
-            if s:
-                messages = s
-        except (OSError, IOError):
-            pass
-
-        if proc_returncode == 0:
-            content = [{"type": "text", "text": proc_stdout.strip()}]
-            if messages:
-                content.append(
-                    {"type": "text", "text": f"--- *Messages* ---\n{messages}"}
-                )
-            return {"content": content}
-
-        combined = (proc_stdout + proc_stderr).strip()
-        return {"content": [{"type": "text", "text": combined}], "isError": True}
-
+        wrapper = _build_eval_wrapper(path_code, use_temp_file=True)
+        return _process_emacsclient_result(_run_emacsclient(wrapper, timeout_s=60))
     finally:
         try:
             os.unlink(path_code)
-        except OSError:
-            pass
-        try:
-            os.unlink(path_msgs)
         except OSError:
             pass
 

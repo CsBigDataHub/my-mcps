@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Protocol-level tests for elisp-eval-server.py _handle().
 
-Run:  python3 test_elisp_eval_protocol.py
-      python3 -m unittest test_elisp_eval_protocol -v
+Run from repo root:
+    python3 elisp-mcp/test_elisp_eval_protocol.py
+    python3 -m unittest discover -s elisp-mcp -p 'test_*.py' -v
 """
 
 import importlib.util
 import json
 import os
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MOD_PATH = os.path.join(_HERE, "elisp-eval-server.py")
@@ -235,6 +237,76 @@ class TestMethodDispatch(_Base):
     def test_unknown_method_with_id(self):
         resp = _handle({"jsonrpc": "2.0", "id": 1, "method": "bogus/thing"})
         self.assert_error_code(resp, -32601)
+
+
+class TestEvalImplementation(_Base):
+    def test_inline_wrapper_uses_base64_payload(self):
+        wrapper = mod._build_eval_wrapper('(message "hi")', use_temp_file=False)
+        self.assertIn("base64-decode-string", wrapper)
+        self.assertNotIn("insert-file-contents", wrapper)
+        self.assertNotIn('(message "hi")', wrapper)
+
+    def test_tempfile_wrapper_uses_insert_file_contents(self):
+        wrapper = mod._build_eval_wrapper("/tmp/example.el", use_temp_file=True)
+        self.assertIn("insert-file-contents", wrapper)
+        self.assertNotIn("base64-decode-string", wrapper)
+        self.assertIn("/tmp/example.el", wrapper)
+
+    def test_parse_emacs_json_string_payload(self):
+        raw = json.dumps(json.dumps({"result": "42", "messages": "hello"}))
+        payload = mod._parse_emacs_eval_output(raw)
+        self.assertEqual(payload["result"], "42")
+        self.assertEqual(payload["messages"], "hello")
+
+    def test_parse_emacs_json_object_payload(self):
+        payload = mod._parse_emacs_eval_output('{"result":"nil","messages":null}')
+        self.assertEqual(payload["result"], "nil")
+        self.assertIsNone(payload["messages"])
+
+    def test_eval_elisp_inline_returns_existing_content_shape(self):
+        with mock.patch.object(
+            mod,
+            "_run_emacsclient",
+            return_value={
+                "returncode": 0,
+                "stdout": json.dumps(
+                    json.dumps({"result": "42", "messages": "from messages"})
+                ),
+                "stderr": "",
+            },
+        ) as run_emacsclient:
+            result = mod._eval_elisp("(+ 40 2)")
+
+        self.assertEqual(result["content"][0]["text"], "42")
+        self.assertEqual(
+            result["content"][1]["text"], "--- *Messages* ---\nfrom messages"
+        )
+        wrapper = run_emacsclient.call_args.args[0]
+        self.assertIn("base64-decode-string", wrapper)
+        self.assertNotIn("insert-file-contents", wrapper)
+
+    def test_eval_elisp_falls_back_to_tempfile_for_large_payloads(self):
+        code = "x" * (mod.INLINE_CODE_MAX_BYTES + 1)
+        file_handle = mock.mock_open()
+        with mock.patch.object(
+            mod.tempfile, "mkstemp", return_value=(123, "/tmp/fallback.el")
+        ), mock.patch.object(mod.os, "fdopen", file_handle), mock.patch.object(
+            mod.os, "unlink"
+        ), mock.patch.object(
+            mod,
+            "_run_emacsclient",
+            return_value={
+                "returncode": 0,
+                "stdout": json.dumps(json.dumps({"result": "ok", "messages": None})),
+                "stderr": "",
+            },
+        ) as run_emacsclient:
+            result = mod._eval_elisp(code)
+
+        self.assertEqual(result["content"][0]["text"], "ok")
+        wrapper = run_emacsclient.call_args.args[0]
+        self.assertIn("insert-file-contents", wrapper)
+        self.assertNotIn("base64-decode-string", wrapper)
 
 
 class TestMainLoop(_Base):
